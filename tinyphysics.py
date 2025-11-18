@@ -1,5 +1,7 @@
 import argparse
+import csv
 import importlib
+import json
 import numpy as np
 import onnxruntime as ort
 import os
@@ -15,7 +17,7 @@ from collections import namedtuple
 from functools import partial
 from hashlib import md5
 from pathlib import Path
-from typing import List, Union, Tuple, Dict
+from typing import List, Union, Tuple, Dict, Optional
 from tqdm.contrib.concurrent import process_map
 
 from controllers import BaseController
@@ -42,6 +44,110 @@ FuturePlan = namedtuple('FuturePlan', ['lataccel', 'roll_lataccel', 'v_ego', 'a_
 
 DATASET_URL = "https://huggingface.co/datasets/commaai/commaSteeringControl/resolve/main/data/SYNTHETIC_V0.zip"
 DATASET_PATH = Path(__file__).resolve().parent / "data"
+
+
+class TraceLogger:
+  """Write TinyPhysics rollouts to a CSV trace (and optional sidecar) for replay.
+
+  Schema (CSV columns):
+    step: Integer simulation step index.
+    target_lataccel: Desired lateral acceleration (m/s^2).
+    current_lataccel: Simulated lateral acceleration after controller output (m/s^2).
+    steer_command: Controller steering command (unitless normalized command).
+    roll_lataccel: Lateral acceleration induced by road roll (m/s^2).
+    v_ego: Vehicle speed (m/s).
+    a_ego: Longitudinal acceleration (m/s^2).
+    controller: Controller implementation name.
+    future_ref: Identifier for the stored future plan (step number for sidecar, 'inline' when embedded).
+    future_plan: JSON string for inline future plan snapshots (empty when using a sidecar).
+
+  Future plans are stored as JSON with keys lataccel, roll_lataccel, v_ego, a_ego, and window.
+  When inline storage is disabled, snapshots are written to a JSONL sidecar named
+  "<trace>.future.jsonl" keyed by the step value.
+  """
+
+  fieldnames = [
+    "step",
+    "target_lataccel",
+    "current_lataccel",
+    "steer_command",
+    "roll_lataccel",
+    "v_ego",
+    "a_ego",
+    "controller",
+    "future_ref",
+    "future_plan",
+  ]
+
+  def __init__(self, trace_path: Union[str, Path], future_window: int = 0, inline_future: bool = True) -> None:
+    self.trace_path = Path(trace_path)
+    self.future_window = max(0, future_window)
+    self.inline_future = inline_future
+    self.sidecar_path = self.trace_path.with_suffix(self.trace_path.suffix + ".future.jsonl")
+    self.trace_path.parent.mkdir(parents=True, exist_ok=True)
+    self._ensure_header()
+
+  def _ensure_header(self) -> None:
+    if not self.trace_path.exists():
+      with open(self.trace_path, "w", newline='', encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+        writer.writeheader()
+
+  def _write_row(self, row: Dict[str, Union[int, float, str]]) -> None:
+    with open(self.trace_path, "a", newline='', encoding="utf-8") as f:
+      writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+      writer.writerow(row)
+
+  def _write_sidecar(self, step: int, snapshot: Dict[str, Union[int, List[float]]]) -> None:
+    self.sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"step": step, "plan": snapshot}
+    with open(self.sidecar_path, "a", encoding="utf-8") as f:
+      f.write(json.dumps(payload))
+      f.write("\n")
+
+  def _serialize_future_plan(self, step: int, future_plan: Optional[FuturePlan]) -> Tuple[str, str]:
+    if not self.future_window or future_plan is None:
+      return "", ""
+
+    slice_end = self.future_window
+    snapshot = {
+      "lataccel": future_plan.lataccel[:slice_end],
+      "roll_lataccel": future_plan.roll_lataccel[:slice_end],
+      "v_ego": future_plan.v_ego[:slice_end],
+      "a_ego": future_plan.a_ego[:slice_end],
+      "window": min(slice_end, len(future_plan.lataccel)),
+    }
+
+    if self.inline_future:
+      return "inline", json.dumps(snapshot)
+
+    self._write_sidecar(step, snapshot)
+    return str(step), ""
+
+  def log_step(
+    self,
+    step: int,
+    target_lataccel: float,
+    current_lataccel: float,
+    steer_command: float,
+    state: State,
+    controller: str,
+    future_plan: Optional[FuturePlan],
+  ) -> None:
+    future_ref, future_plan_json = self._serialize_future_plan(step, future_plan)
+    row = {
+      "step": step,
+      "target_lataccel": target_lataccel,
+      "current_lataccel": current_lataccel,
+      "steer_command": steer_command,
+      "roll_lataccel": state.roll_lataccel,
+      "v_ego": state.v_ego,
+      "a_ego": state.a_ego,
+      "controller": controller,
+      "future_ref": future_ref,
+      "future_plan": future_plan_json,
+    }
+    self._write_row(row)
 
 class LataccelTokenizer:
   def __init__(self):
@@ -96,12 +202,20 @@ class TinyPhysicsModel:
 
 
 class TinyPhysicsSimulator:
-  def __init__(self, model: TinyPhysicsModel, data_path: str, controller: BaseController, debug: bool = False) -> None:
+  def __init__(
+    self,
+    model: TinyPhysicsModel,
+    data_path: str,
+    controller: BaseController,
+    debug: bool = False,
+    trace_logger: Optional[TraceLogger] = None,
+  ) -> None:
     self.data_path = data_path
     self.sim_model = model
     self.data = self.get_data(data_path)
     self.controller = controller
     self.debug = debug
+    self.trace_logger = trace_logger
     self.reset()
 
   def reset(self) -> None:
@@ -123,7 +237,8 @@ class TinyPhysicsSimulator:
       'v_ego': df['vEgo'].values,
       'a_ego': df['aEgo'].values,
       'target_lataccel': df['targetLateralAcceleration'].values,
-      'steer_command': -df['steerCommand'].values  # steer commands are logged with left-positive convention but this simulator uses right-positive
+      # Steer commands are logged with left-positive convention but this simulator uses right-positive.
+      'steer_command': -df['steerCommand'].values
     })
     return processed_df
 
@@ -168,6 +283,17 @@ class TinyPhysicsSimulator:
     self.futureplan = futureplan
     self.control_step(self.step_idx)
     self.sim_step(self.step_idx)
+
+    if self.trace_logger is not None:
+      self.trace_logger.log_step(
+        step=self.step_idx,
+        target_lataccel=target,
+        current_lataccel=self.current_lataccel,
+        steer_command=self.action_history[-1],
+        state=state,
+        controller=self.controller.__class__.__name__,
+        future_plan=self.futureplan,
+      )
     self.step_idx += 1
 
   def plot_data(self, ax, lines, axis_labels, title) -> None:
@@ -214,10 +340,16 @@ def get_available_controllers():
   return [f.stem for f in Path('controllers').iterdir() if f.is_file() and f.suffix == '.py' and f.stem != '__init__']
 
 
-def run_rollout(data_path, controller_type, model_path, debug=False):
+def run_rollout(data_path, controller_type, model_path, debug=False, trace_logger: Optional[TraceLogger] = None):
   tinyphysicsmodel = TinyPhysicsModel(model_path, debug=debug)
   controller = importlib.import_module(f'controllers.{controller_type}').Controller()
-  sim = TinyPhysicsSimulator(tinyphysicsmodel, str(data_path), controller=controller, debug=debug)
+  sim = TinyPhysicsSimulator(
+    tinyphysicsmodel,
+    str(data_path),
+    controller=controller,
+    debug=debug,
+    trace_logger=trace_logger,
+  )
   return sim.rollout(), sim.target_lataccel_history, sim.current_lataccel_history
 
 
@@ -239,6 +371,9 @@ if __name__ == "__main__":
   parser.add_argument("--data_path", type=str, required=True)
   parser.add_argument("--num_segs", type=int, default=100)
   parser.add_argument("--debug", action='store_true')
+  parser.add_argument("--log-trace", type=str, help="Write per-step trace CSV to this path")
+  parser.add_argument("--log-future", type=int, default=0, help="Number of future plan steps to snapshot into the trace")
+  parser.add_argument("--future-sidecar", action='store_true', help="Save future plans in a JSONL sidecar instead of inline CSV")
   parser.add_argument("--controller", default='pid', choices=available_controllers)
   args = parser.parse_args()
 
@@ -246,10 +381,16 @@ if __name__ == "__main__":
     download_dataset()
 
   data_path = Path(args.data_path)
+  trace_logger = None
+  if args.log_trace:
+    trace_logger = TraceLogger(args.log_trace, future_window=args.log_future, inline_future=not args.future_sidecar)
+
   if data_path.is_file():
-    cost, _, _ = run_rollout(data_path, args.controller, args.model_path, debug=args.debug)
+    cost, _, _ = run_rollout(data_path, args.controller, args.model_path, debug=args.debug, trace_logger=trace_logger)
     print(f"\nAverage lataccel_cost: {cost['lataccel_cost']:>6.4}, average jerk_cost: {cost['jerk_cost']:>6.4}, average total_cost: {cost['total_cost']:>6.4}")
   elif data_path.is_dir():
+    if trace_logger is not None:
+      raise ValueError("Logging a directory of traces is not supported; please log individual files")
     run_rollout_partial = partial(run_rollout, controller_type=args.controller, model_path=args.model_path, debug=False)
     files = sorted(data_path.iterdir())[:args.num_segs]
     results = process_map(run_rollout_partial, files, max_workers=16, chunksize=10)

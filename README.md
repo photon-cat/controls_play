@@ -39,6 +39,25 @@ python eval.py --model_path ./models/tinyphysics.onnx --data_path ./data --num_s
 ```
 You can also use the notebook at [`experiment.ipynb`](https://github.com/commaai/controls_challenge/blob/master/experiment.ipynb) for exploration.
 
+## Trace logging and viewer
+Generate machine-readable rollouts without opening the GUI by enabling the trace logger:
+
+```
+python tinyphysics.py --model_path ./models/tinyphysics.onnx --data_path ./data/00000.csv \
+  --controller pid --log-trace /tmp/trace.csv --log-future 20
+```
+
+The CSV schema (and optional `.future.jsonl` sidecar) is documented in `trace_loader.py` and includes:
+`step`, `target_lataccel`, `current_lataccel`, `steer_command`, `roll_lataccel`, `v_ego`, `a_ego`, `controller`, `future_ref`, and `future_plan` (inline JSON when requested). Use `--future-sidecar` to keep future plans in a JSONL next to the CSV.
+
+You can inspect traces with the interactive viewer:
+
+```
+python tools/trace_viewer.py /tmp/trace.csv
+```
+
+The viewer supports playback controls, bookmarks, future-plan previews, and overlaying multiple traces to compare controller revisions.
+
 ## TinyPhysics
 This is a "simulated car" that has been trained to mimic a very simple physics model (bicycle model) based simulator, given realistic driving noise. It is an autoregressive model similar to [ML Controls Sim](https://blog.comma.ai/096release/#ml-controls-sim) in architecture. Its inputs are the car velocity (`v_ego`), forward acceleration (`a_ego`), lateral acceleration due to road roll (`road_lataccel`), current car lateral acceleration (`current_lataccel`), and a steer input (`steer_action`), then it predicts the resultant lateral acceleration of the car.
 
