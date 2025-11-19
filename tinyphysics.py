@@ -15,10 +15,11 @@ from collections import namedtuple
 from functools import partial
 from hashlib import md5
 from pathlib import Path
-from typing import List, Union, Tuple, Dict
+from typing import Dict, List, Optional, Tuple, Union
 from tqdm.contrib.concurrent import process_map
 
 from controllers import BaseController
+from trace_logging import TraceLogger
 
 sns.set_theme()
 signal.signal(signal.SIGINT, signal.SIG_DFL)  # Enable Ctrl-C on plot windows
@@ -60,16 +61,34 @@ class LataccelTokenizer:
 
 
 class TinyPhysicsModel:
-  def __init__(self, model_path: str, debug: bool) -> None:
+  def __init__(self, model_path: str, debug: bool, use_coreml: bool = False, num_threads: int = 1) -> None:
     self.tokenizer = LataccelTokenizer()
     options = ort.SessionOptions()
-    options.intra_op_num_threads = 1
-    options.inter_op_num_threads = 1
+    options.intra_op_num_threads = num_threads
+    options.inter_op_num_threads = num_threads
     options.log_severity_level = 3
-    provider = 'CPUExecutionProvider'
-
+    
+    # Select execution provider
+    available_providers = ort.get_available_providers()
+    providers_to_try = ['CPUExecutionProvider']  # Default fallback
+    
+    if use_coreml and 'CoreMLExecutionProvider' in available_providers:
+      # Try CoreML first, with CPU as fallback
+      providers_to_try = ['CoreMLExecutionProvider', 'CPUExecutionProvider']
+      if not debug:
+        print(f"Attempting CoreML acceleration (CPU fallback enabled)")
+    
     with open(model_path, "rb") as f:
-      self.ort_session = ort.InferenceSession(f.read(), options, [provider])
+      try:
+        self.ort_session = ort.InferenceSession(f.read(), options, providers_to_try)
+        actual_provider = self.ort_session.get_providers()[0]
+        if not debug and use_coreml:
+          print(f"Using: {actual_provider}")
+      except Exception as e:
+        if use_coreml:
+          print(f"CoreML failed ({e}), falling back to CPU")
+        # Fallback to CPU only
+        self.ort_session = ort.InferenceSession(f.read(), options, ['CPUExecutionProvider'])
 
   def softmax(self, x, axis=-1):
     e_x = np.exp(x - np.max(x, axis=axis, keepdims=True))
@@ -96,12 +115,20 @@ class TinyPhysicsModel:
 
 
 class TinyPhysicsSimulator:
-  def __init__(self, model: TinyPhysicsModel, data_path: str, controller: BaseController, debug: bool = False) -> None:
+  def __init__(
+    self,
+    model: TinyPhysicsModel,
+    data_path: str,
+    controller: BaseController,
+    debug: bool = False,
+    trace_logger: Optional[TraceLogger] = None,
+  ) -> None:
     self.data_path = data_path
     self.sim_model = model
     self.data = self.get_data(data_path)
     self.controller = controller
     self.debug = debug
+    self.trace_logger = trace_logger
     self.reset()
 
   def reset(self) -> None:
@@ -168,6 +195,22 @@ class TinyPhysicsSimulator:
     self.futureplan = futureplan
     self.control_step(self.step_idx)
     self.sim_step(self.step_idx)
+    if self.trace_logger:
+      self.trace_logger.log_step(
+        step=self.step_idx,
+        target_lataccel=target,
+        current_lataccel=self.current_lataccel,
+        steer_command=self.action_history[-1],
+        roll_lataccel=state.roll_lataccel,
+        v_ego=state.v_ego,
+        a_ego=state.a_ego,
+        future_plan={
+          'lataccel': futureplan.lataccel,
+          'roll_lataccel': futureplan.roll_lataccel,
+          'v_ego': futureplan.v_ego,
+          'a_ego': futureplan.a_ego,
+        },
+      )
     self.step_idx += 1
 
   def plot_data(self, ax, lines, axis_labels, title) -> None:
@@ -207,6 +250,8 @@ class TinyPhysicsSimulator:
     if self.debug:
       plt.ioff()
       plt.show()
+    if self.trace_logger:
+      self.trace_logger.close()
     return self.compute_cost()
 
 
@@ -214,10 +259,16 @@ def get_available_controllers():
   return [f.stem for f in Path('controllers').iterdir() if f.is_file() and f.suffix == '.py' and f.stem != '__init__']
 
 
-def run_rollout(data_path, controller_type, model_path, debug=False):
-  tinyphysicsmodel = TinyPhysicsModel(model_path, debug=debug)
+def run_rollout(data_path, controller_type, model_path, debug=False, trace_logger: Optional[TraceLogger] = None, use_coreml=False, num_threads=1):
+  tinyphysicsmodel = TinyPhysicsModel(model_path, debug=debug, use_coreml=use_coreml, num_threads=num_threads)
   controller = importlib.import_module(f'controllers.{controller_type}').Controller()
-  sim = TinyPhysicsSimulator(tinyphysicsmodel, str(data_path), controller=controller, debug=debug)
+  sim = TinyPhysicsSimulator(
+    tinyphysicsmodel,
+    str(data_path),
+    controller=controller,
+    debug=debug,
+    trace_logger=trace_logger,
+  )
   return sim.rollout(), sim.target_lataccel_history, sim.current_lataccel_history
 
 
@@ -240,6 +291,11 @@ if __name__ == "__main__":
   parser.add_argument("--num_segs", type=int, default=100)
   parser.add_argument("--debug", action='store_true')
   parser.add_argument("--controller", default='pid', choices=available_controllers)
+  parser.add_argument("--log-trace", type=str, help="Optional path to write a per-step trace CSV")
+  parser.add_argument("--log-future", type=int, default=0, help="Number of future-plan steps to serialize per row")
+  parser.add_argument("--future-sidecar", type=str, help="Write future plans to a JSONL sidecar instead of inline JSON")
+  parser.add_argument("--use-coreml", action='store_true', help="Use CoreML acceleration on Mac (Apple Neural Engine)")
+  parser.add_argument("--num-threads", type=int, default=4, help="Number of CPU threads for inference (default: 4)")
   args = parser.parse_args()
 
   if not DATASET_PATH.exists():
@@ -247,12 +303,31 @@ if __name__ == "__main__":
 
   data_path = Path(args.data_path)
   if data_path.is_file():
-    cost, _, _ = run_rollout(data_path, args.controller, args.model_path, debug=args.debug)
+    trace_logger = None
+    if args.log_trace:
+      sidecar = Path(args.future_sidecar) if args.future_sidecar else None
+      trace_logger = TraceLogger(
+        Path(args.log_trace),
+        controller_name=args.controller,
+        control_start_idx=CONTROL_START_IDX,
+        log_future_steps=args.log_future,
+        future_sidecar=sidecar,
+      )
+    cost, _, _ = run_rollout(data_path, args.controller, args.model_path, debug=args.debug, trace_logger=trace_logger, use_coreml=args.use_coreml, num_threads=args.num_threads)
     print(f"\nAverage lataccel_cost: {cost['lataccel_cost']:>6.4}, average jerk_cost: {cost['jerk_cost']:>6.4}, average total_cost: {cost['total_cost']:>6.4}")
   elif data_path.is_dir():
-    run_rollout_partial = partial(run_rollout, controller_type=args.controller, model_path=args.model_path, debug=False)
+    if args.log_trace:
+      raise SystemExit("Logging is only supported for a single file run")
+    run_rollout_partial = partial(run_rollout, controller_type=args.controller, model_path=args.model_path, debug=False, use_coreml=args.use_coreml, num_threads=args.num_threads)
     files = sorted(data_path.iterdir())[:args.num_segs]
-    results = process_map(run_rollout_partial, files, max_workers=16, chunksize=10)
+    
+    # CoreML has compilation overhead - use sequential processing
+    # CPU benefits from multiprocessing
+    max_workers = 1 if args.use_coreml else 16
+    if args.use_coreml:
+      print("Note: CoreML uses sequential processing due to compilation overhead")
+    
+    results = process_map(run_rollout_partial, files, max_workers=max_workers, chunksize=10)
     costs = [result[0] for result in results]
     costs_df = pd.DataFrame(costs)
     print(f"\nAverage lataccel_cost: {np.mean(costs_df['lataccel_cost']):>6.4}, average jerk_cost: {np.mean(costs_df['jerk_cost']):>6.4}, average total_cost: {np.mean(costs_df['total_cost']):>6.4}")
