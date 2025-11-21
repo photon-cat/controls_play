@@ -44,6 +44,15 @@ You can also use the notebook at [`experiment.ipynb`](https://github.com/commaai
 - `--log-future` controls how many steps of the future plan to serialize. Omit `--future-sidecar` to embed the plan JSON inline in the CSV.
 - Inspect one or more traces with `python tools/trace_viewer.py trace.csv --future-path trace.csv.future.jsonl`, then use the slider/playback controls to compare controllers, preview plans, and bookmark interesting steps.
 
+## Interactive simulator
+Need a faster feedback loop than CSVs? Launch the PyVista world simulator:
+
+```
+python interactive_sim.py --model_path ./models/tinyphysics.onnx
+```
+
+It treats TinyPhysics as a lateral-accel engine, moves the car through canned road scenarios (crown, S-curve, sweeping highway, adversarial noise), renders the future plan, and lets you hot-swap controllers or take over instantly with manual steering keys. Fault toggles (tire failure, steer delay, lateral noise, etc.) help build confidence that your controller will not implode the moment the world gets weird. See [`docs/interactive_sim.md`](docs/interactive_sim.md) for all hotkeys and scenario details.
+
 ## TinyPhysics
 This is a "simulated car" that has been trained to mimic a very simple physics model (bicycle model) based simulator, given realistic driving noise. It is an autoregressive model similar to [ML Controls Sim](https://blog.comma.ai/096release/#ml-controls-sim) in architecture. Its inputs are the car velocity (`v_ego`), forward acceleration (`a_ego`), lateral acceleration due to road roll (`road_lataccel`), current car lateral acceleration (`current_lataccel`), and a steer input (`steer_action`), then it predicts the resultant lateral acceleration of the car.
 
