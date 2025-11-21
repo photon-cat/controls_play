@@ -1,125 +1,102 @@
-from collections import deque
+"""Preview-enhanced PID-style controller.
+
+The controller keeps the simplicity of a PID loop while adding a short preview
+window and a light feedforward term so it reacts earlier on curved segments and
+reduces total control cost.
+"""
+
 import numpy as np
 
 from controllers import BaseController
 
 
 class Controller(BaseController):
-  """
-  PID baseline with gentle autotuning, gain scheduling, and anti-windup.
+    def __init__(self):
+        # Steering/lataccel relationship
+        self.steer_to_latacc = 2.6
 
-  The authority is intentionally limited so we stay near the well-behaved region,
-  while the P/D terms decay with speed to avoid high-speed oscillations.
-  """
+        # Feedback gains (PID-style)
+        self.kp = 0.34
+        self.ki = 0.1
+        self.kd = -0.04
+        self.integral = 0.0
+        self.integral_limit = 50.0
+        self.integral_decay = 0.995
 
-  def __init__(self):
-    # Base PID gains taken from the hand-tuned controller
-    self.kp_base = 0.195
-    self.ki_base = 0.100
-    self.kd_base = -0.053
+        # Limits
+        self.steer_limit = 2.0
+        self.rate_limit = 0.3
+        self.roll_comp_gain = 0.85
 
-    # Autotune state
-    self.kp_scale = 1.0
-    self.ki_scale = 1.0
-    self.kp_scale_min = 0.6
-    self.kp_scale_max = 1.6
-    self.ki_scale_min = 0.4
-    self.ki_scale_max = 1.2
-    self.autotune_alpha = 0.02
-    self.error_window = deque(maxlen=40)
-    self.error_rms = 0.0
-    self.high_band = 0.35  # rms error threshold for adding authority
-    self.low_band = 0.12   # rms error threshold for reducing authority
+        # Preview/target shaping
+        self.preview_steps = 8
+        self.preview_decay = 0.92
 
-    # PID internal state
-    self.error_integral = 0.0
-    self.integral_limit = 5.0
-    self.integral_decay = 0.998
-    self.prev_error = 0.0
-    self.derivative_state = 0.0
-    self.derivative_alpha = 0.25
+        # State/history
+        self.prev_command = 0.0
+        self.initialized = False
+        self.prev_error = 0.0
+        self.prev_lataccel = 0.0
+        self.prev_applied_action = 0.0
+        self.last_applied_action = 0.0
+        self.alpha_command = 0.45
 
-    # Output limits (/Users/delta/comma/controls_play/tinyphysics.py clamps steer to +-2)
-    self.steer_min = -2.0
-    self.steer_max = 2.0
-    self.authority_limit = 0.9  # additional software authority limit
-    self.max_delta = 0.15       # slew-rate limit per cycle
-    self.prev_command = 0.0
+    def observe_applied_action(self, applied_action: float):
+        self.prev_applied_action = self.last_applied_action
+        self.last_applied_action = float(applied_action)
 
-  def observe_applied_action(self, applied_action: float):
-    # Track what was actually applied so the slew limiter stays in sync
-    applied = float(np.clip(applied_action, -self.authority_limit, self.authority_limit))
-    self.prev_command = applied
+    def _compute_preview_target(self, target_lataccel: float, future_plan):
+        if future_plan is None or len(future_plan.lataccel) == 0:
+            return target_lataccel
 
-  def _autotune(self):
-    if not self.error_window:
-      return
-    abs_error = np.abs(np.array(self.error_window))
-    rms = float(np.sqrt(np.mean(abs_error ** 2)))
-    self.error_rms = (1.0 - self.autotune_alpha) * self.error_rms + self.autotune_alpha * rms
+        lookahead = min(self.preview_steps, len(future_plan.lataccel))
+        future_lat = np.array(future_plan.lataccel[:lookahead])
+        future_roll = np.array(future_plan.roll_lataccel[:lookahead]) if len(future_plan.roll_lataccel) >= lookahead else np.zeros(lookahead)
+        compensated_future = future_lat - self.roll_comp_gain * future_roll
+        weights = self.preview_decay ** np.arange(lookahead)
+        blended = float((weights * compensated_future).sum() / weights.sum())
+        return 0.5 * target_lataccel + 0.5 * blended
 
-    if self.error_rms > self.high_band:
-      self.kp_scale = min(self.kp_scale + 0.02, self.kp_scale_max)
-      self.ki_scale = min(self.ki_scale + 0.01, self.ki_scale_max)
-    elif self.error_rms < self.low_band:
-      self.kp_scale = max(self.kp_scale - 0.01, self.kp_scale_min)
-      self.ki_scale = max(self.ki_scale - 0.005, self.ki_scale_min)
+    def update(self, target_lataccel, current_lataccel, state, future_plan=None):
+        roll_comp = self.roll_comp_gain * float(state.roll_lataccel)
+        measured = float(current_lataccel) - roll_comp
+        target = float(target_lataccel) - roll_comp
 
-  def _get_feedforward(self, target_lataccel, future_plan):
-    if future_plan and getattr(future_plan, "lataccel", None):
-      lookahead = min(5, len(future_plan.lataccel))
-      if lookahead > 0:
-        future_delta = float(future_plan.lataccel[lookahead - 1]) - float(target_lataccel)
-        return 0.05 * future_delta
-    return 0.0
+        if not self.initialized:
+            self.prev_lataccel = measured
+            self.initialized = True
 
-  def update(self, target_lataccel, current_lataccel, state, future_plan):
-    error = float(target_lataccel) - float(current_lataccel)
-    self.error_window.append(error)
-    self._autotune()
+        # Preview the target to smooth commands.
+        shaped_target = self._compute_preview_target(target, future_plan)
 
-    # Integral term with decay to avoid runaway bias accumulation
-    self.error_integral *= self.integral_decay
-    self.error_integral += error
-    self.error_integral = np.clip(self.error_integral, -self.integral_limit, self.integral_limit)
+        # Feedback terms.
+        error = shaped_target - measured
+        d_error = error - self.prev_error
 
-    # Derivative smoothing keeps noise out of the D channel
-    raw_derivative = error - self.prev_error
-    self.derivative_state = (
-      self.derivative_alpha * raw_derivative +
-      (1.0 - self.derivative_alpha) * self.derivative_state
-    )
-    self.prev_error = error
+        self.integral = np.clip(
+            self.integral * self.integral_decay + error,
+            -self.integral_limit,
+            self.integral_limit,
+        )
+        correction = self.kp * error + self.ki * self.integral + self.kd * d_error
 
-    # Gain scheduling vs speed (never blows up below 5 m/s)
-    speed = max(float(getattr(state, "v_ego", 0.0)), 0.0)
-    speed_scale = 1.0 / max(speed, 5.0)
-    kp = self.kp_base * self.kp_scale * speed_scale
-    kd = self.kd_base * speed_scale
-    ki = self.ki_base * self.ki_scale
+        # Feedforward based on current gain estimate.
+        feedforward = np.clip(shaped_target / self.steer_to_latacc, -self.steer_limit, self.steer_limit)
 
-    feedforward = self._get_feedforward(target_lataccel, future_plan)
-    command = kp * error + ki * self.error_integral + kd * self.derivative_state + feedforward
+        raw_command = feedforward + correction
 
-    # Physical clamp with classical clamping anti-windup
-    command_clamped = np.clip(command, self.steer_min, self.steer_max)
-    saturated_high = command > self.steer_max
-    saturated_low = command < self.steer_min
-    if saturated_high and error > 0.0:
-      self.error_integral -= error
-    elif saturated_low and error < 0.0:
-      self.error_integral -= error
+        # Blend with the previous command for stability.
+        blended_command = (1.0 - self.alpha_command) * self.prev_command + self.alpha_command * raw_command
 
-    if saturated_high or saturated_low:
-      # Rebuild command using the updated integral so future steps stay aligned
-      command = kp * error + ki * self.error_integral + kd * self.derivative_state + feedforward
-      command_clamped = np.clip(command, self.steer_min, self.steer_max)
+        # Rate limiting relative to the last applied action to keep jerk low.
+        ref = self.last_applied_action if self.initialized else self.prev_command
+        max_delta = self.rate_limit
+        limited_command = np.clip(blended_command, ref - max_delta, ref + max_delta)
+        limited_command = np.clip(limited_command, -self.steer_limit, self.steer_limit)
 
-    # Limited authority + slew-rate limit
-    desired = np.clip(command_clamped, -self.authority_limit, self.authority_limit)
-    delta = np.clip(desired - self.prev_command, -self.max_delta, self.max_delta)
-    command_limited = self.prev_command + delta
-    command_limited = np.clip(command_limited, -self.authority_limit, self.authority_limit)
-    self.prev_command = command_limited
+        # Book-keeping for next step.
+        self.prev_command = limited_command
+        self.prev_lataccel = measured
+        self.prev_error = error
 
-    return command_limited
+        return float(limited_command)
