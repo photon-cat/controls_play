@@ -1,3 +1,11 @@
+"""
+whats my state, and what do I know right now?
+state = what the system knows about the vehicle
+desired behavior = target_lataccel, measured behavior = current_lataccel
+in this ex PID chooses to project all that knowledge down to one scalar error: current_lataccel - target_lataccel
+system knowledge = vEgo, aEgo, roll (not used)
+"""
+
 from . import BaseController
 import numpy as np
 
