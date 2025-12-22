@@ -58,7 +58,7 @@ Run the following command, then submit `report.html` and your code to [this form
 Competitive scores (`total_cost<100`) will be added to the leaderboard
 
 ```
-python eval.py --model_path ./models/tinyphysics.onnx --data_path ./data --num_segs 5000 --test_controller <insert your controller name> --baseline_controller pid
+python eval.py --model_path ./models/tinyphysics.onnx --data_path ./data --num_segs 5000 --test_controller pid_ff_scheduled_tune --baseline_controller pid 
 ```
 
 ## Changelog

@@ -100,6 +100,7 @@ def main():
     global tuner_state
     parser = argparse.ArgumentParser()
     parser.add_argument("--speed_group", type=str, default="speed_36_40")
+    parser.add_argument("--speed_idx", type=int, default=None, help="Manually specify the index in the gain arrays to tune (0-10)")
     parser.add_argument("--max_total_iter", type=int, default=100, help="Total number of simulations allowed per group")
     parser.add_argument("--num_files", type=int, default=3, help="Number of CSV files to use")
     parser.add_argument("--method", type=str, default="Hybrid", choices=["Nelder-Mead", "DE", "Hybrid"])
@@ -127,7 +128,12 @@ def main():
         "speed_16_20": 5, "speed_20_24": 6, "speed_24_28": 7, "speed_28_32": 8,
         "speed_32_36": 9, "speed_36_40": 10
     }
-    speed_idx = speed_map.get(args.speed_group, 10)
+    
+    if args.speed_idx is not None:
+        speed_idx = args.speed_idx
+    else:
+        speed_idx = speed_map.get(args.speed_group, 10)
+        
     tuner_state = TunerState(speed_idx)
 
     module = importlib.import_module(CONTROLLER_MODULE)
@@ -171,3 +177,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
