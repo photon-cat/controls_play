@@ -1,0 +1,23 @@
+{
+  "run_name": "20251225_171024",
+  "args": {
+    "data_path": "data",
+    "physics_model": "models/tinyphysics.onnx",
+    "output": "models/steer_model_rl3.pt",
+    "hidden": 128,
+    "batch_size": 256,
+    "epochs": 15,
+    "lr": 0.0003,
+    "loss_threshold": 0.005,
+    "supervised_epochs": 0,
+    "n_workers": 1,
+    "max_files": null,
+    "resume": "models/checkpoints_20251225_170056/epoch_001.pt",
+    "pure_rl": true,
+    "phase2_start_epoch": 0,
+    "start_phase": 3
+  },
+  "epochs": [],
+  "best_val_loss": Infinity,
+  "best_rl_cost": Infinity
+}

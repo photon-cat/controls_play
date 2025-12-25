@@ -2,9 +2,9 @@ from . import BaseController
 import numpy as np
 
 class Controller(BaseController):
-    """ PID controller with preview feed-forward for lateral acceleration tracking """
+    """ PID controller with preview feed-forward and gain scheduled (p i d terms and target control point) from 0-40m/s """
     def __init__(self):
-        # Gains at [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40] m/s
+        # gains at [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40] m/s
         self.v_points = np.arange(0, 41, 4)
         self.p_points = np.array([0.2207, 0.2040, 0.1855, 0.1696, 0.1601, 0.1583, 0.1590, 0.1596, 0.1610, 0.1651, 0.1720])
         self.i_points = np.array([0.1366, 0.1193, 0.1083, 0.1068, 0.1122, 0.1217, 0.1295, 0.1329, 0.1273, 0.1132, 0.0928])
@@ -16,7 +16,7 @@ class Controller(BaseController):
         self.preview_points = np.array([0.9396, 1.5628, 1.9278, 1.9776, 1.8278, 1.6836, 1.5812, 1.5230, 1.4707, 1.5023, 1.6097])
 
     def update(self, target_lataccel, current_lataccel, state, future_plan):
-        # --- scheduled gains ---
+        # linear interp for p i d ff & preview points 
         v_ego = state.v_ego
         kp = np.interp(v_ego, self.v_points, self.p_points)
         ki = np.interp(v_ego, self.v_points, self.i_points)
@@ -24,7 +24,7 @@ class Controller(BaseController):
         kf = np.interp(v_ego, self.v_points, self.k_ff_points)
         preview_steps = np.interp(v_ego, self.v_points, self.preview_points)
 
-        #fractional preview target
+        #fractional preview target for lataccel 
         if future_plan is not None and hasattr(future_plan, "lataccel"):
             idx_low = int(np.floor(preview_steps))
             idx_high = int(np.ceil(preview_steps))
@@ -41,9 +41,9 @@ class Controller(BaseController):
         else:
             a_ref = target_lataccel
 
-        # --- feed-forward ---
+        # feedforward 
         u_ff = kf * a_ref
-        # --- feedback ---
+        # pid feedback loop 
         error = a_ref - current_lataccel
         self.error_integral += error
         error_diff = error - self.prev_error
