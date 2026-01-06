@@ -1,0 +1,104 @@
+{
+  "run_name": "20251225_180306",
+  "args": {
+    "data_path": "data",
+    "physics_model": "models/tinyphysics.onnx",
+    "output": "models/steer_model_teacher_rl.pt",
+    "hidden": 128,
+    "batch_size": 256,
+    "epochs": 10,
+    "lr": 0.0003,
+    "loss_threshold": 0.005,
+    "supervised_epochs": 0,
+    "n_workers": 16,
+    "max_files": null,
+    "resume": "models/teacher_ckpts_20251225_173549/imitation_epoch_003.pt",
+    "pure_rl": true,
+    "phase2_start_epoch": 0,
+    "start_phase": 3
+  },
+  "epochs": [
+    {
+      "epoch": 1,
+      "phase": 3,
+      "train_loss": 0,
+      "val_loss": 0.010281070322170854,
+      "rl_cost": 1817.1215864004607,
+      "lr": 0.00029265847744427303
+    },
+    {
+      "epoch": 2,
+      "phase": 3,
+      "train_loss": 0,
+      "val_loss": 0.016218341135978698,
+      "rl_cost": 3772.2981581469594,
+      "lr": 0.0002713525491562421
+    },
+    {
+      "epoch": 3,
+      "phase": 3,
+      "train_loss": 0,
+      "val_loss": 0.01820851703621447,
+      "rl_cost": 4995.029899765489,
+      "lr": 0.00023816778784387096
+    },
+    {
+      "epoch": 4,
+      "phase": 3,
+      "train_loss": 0,
+      "val_loss": 0.01799686470851302,
+      "rl_cost": 9337.667987379835,
+      "lr": 0.0001963525491562421
+    },
+    {
+      "epoch": 5,
+      "phase": 3,
+      "train_loss": 0,
+      "val_loss": 0.020555502505600454,
+      "rl_cost": 15562.094346484937,
+      "lr": 0.00015
+    },
+    {
+      "epoch": 6,
+      "phase": 3,
+      "train_loss": 0,
+      "val_loss": 0.02206867558397353,
+      "rl_cost": 20779.93538178324,
+      "lr": 0.0001036474508437579
+    },
+    {
+      "epoch": 7,
+      "phase": 3,
+      "train_loss": 0,
+      "val_loss": 0.022619468685984613,
+      "rl_cost": 25241.15251438488,
+      "lr": 6.183221215612905e-05
+    },
+    {
+      "epoch": 8,
+      "phase": 3,
+      "train_loss": 0,
+      "val_loss": 0.02277555072233081,
+      "rl_cost": 24586.601664238813,
+      "lr": 2.86474508437579e-05
+    },
+    {
+      "epoch": 9,
+      "phase": 3,
+      "train_loss": 0,
+      "val_loss": 0.022994508678093554,
+      "rl_cost": 19697.697973404647,
+      "lr": 7.341522555726971e-06
+    },
+    {
+      "epoch": 10,
+      "phase": 3,
+      "train_loss": 0,
+      "val_loss": 0.02303784368894994,
+      "rl_cost": 17027.53903228232,
+      "lr": 0.0
+    }
+  ],
+  "best_val_loss": 0.010281070322170854,
+  "best_rl_cost": 1817.1215864004607
+}

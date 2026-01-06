@@ -1,0 +1,8 @@
+{
+  "dataset": "datasets/pid_ff_1k.npz",
+  "alpha": 2.5,
+  "hidden": 256,
+  "batch_size": 256,
+  "steps": 50000,
+  "normalize": true
+}

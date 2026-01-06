@@ -1,0 +1,64 @@
+{
+  "run_name": "20251226_072217",
+  "args": {
+    "data_path": "data",
+    "physics_model": "models/tinyphysics.onnx",
+    "output": "models/steer_model_teacher_rl.pt",
+    "hidden": 128,
+    "batch_size": 256,
+    "epochs": 5,
+    "lr": 0.0003,
+    "loss_threshold": 0.005,
+    "supervised_epochs": 0,
+    "n_workers": 16,
+    "max_files": null,
+    "resume": "models/teacher_ckpts_20251225_173549/imitation_epoch_003.pt",
+    "pure_rl": true,
+    "phase2_start_epoch": 0,
+    "start_phase": 3
+  },
+  "epochs": [
+    {
+      "epoch": 1,
+      "phase": 3,
+      "train_loss": 0,
+      "val_loss": 0.004391612564399838,
+      "rl_cost": 1744.2345663510548,
+      "lr": 0.0002713525491562421
+    },
+    {
+      "epoch": 2,
+      "phase": 3,
+      "train_loss": 0,
+      "val_loss": 0.005369281203486025,
+      "rl_cost": 2146.295521207679,
+      "lr": 0.0001963525491562421
+    },
+    {
+      "epoch": 3,
+      "phase": 3,
+      "train_loss": 0,
+      "val_loss": 0.0068604416035115716,
+      "rl_cost": 2908.418348767861,
+      "lr": 0.00010364745084375788
+    },
+    {
+      "epoch": 4,
+      "phase": 3,
+      "train_loss": 0,
+      "val_loss": 0.008206259198859334,
+      "rl_cost": 3696.119434250531,
+      "lr": 2.8647450843757894e-05
+    },
+    {
+      "epoch": 5,
+      "phase": 3,
+      "train_loss": 0,
+      "val_loss": 0.00870077689550817,
+      "rl_cost": 4146.176502369904,
+      "lr": 0.0
+    }
+  ],
+  "best_val_loss": 0.004391612564399838,
+  "best_rl_cost": 1744.2345663510548
+}

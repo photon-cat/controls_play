@@ -116,7 +116,9 @@ class SteerModelRL(nn.Module):
         # Get mean and std
         mean = self.mean_head(current_out).squeeze(-1)
         log_std = self.log_std_head(current_out).squeeze(-1)
-        std = torch.exp(log_std.clamp(-5, 2))  # clamp for stability
+        # Std for exploration - larger for better exploration
+        # exp(-2)=0.135, exp(-0.5)=0.606
+        std = torch.exp(log_std.clamp(-2, -0.5))
         
         if deterministic:
             return mean, std, None
@@ -344,9 +346,9 @@ class RLController:
 def rl_rollout(model, data_path, physics_model_path, device, deterministic=False, collect_trajectory=False):
     """
     Run one episode on simulator.
-    Returns: cost, log_probs, lataccel trajectory, (optional) trajectory for REINFORCE
+    Returns: cost, log_probs, lataccel trajectory, (optional) trajectory with per-step costs
     """
-    from tinyphysics import TinyPhysicsModel, TinyPhysicsSimulator, CONTEXT_LENGTH as SIM_CONTEXT
+    from tinyphysics import TinyPhysicsModel, TinyPhysicsSimulator, CONTEXT_LENGTH as SIM_CONTEXT, DEL_T, LAT_ACCEL_COST_MULTIPLIER
     
     # Setup
     controller = RLController(model, device)
@@ -357,7 +359,8 @@ def rl_rollout(model, data_path, physics_model_path, device, deterministic=False
         def __init__(self, rl_ctrl):
             self.rl_ctrl = rl_ctrl
             self.log_probs = []
-            self.trajectory = []  # (past, cur, fut, action) for REINFORCE
+            self.trajectory = []  # (past, cur, fut, action, step_cost) for RL
+            self.prev_lataccel = None
         
         def update(self, target_lataccel, current_lataccel, state, future_plan):
             action, log_prob = self.rl_ctrl.get_action(
@@ -367,10 +370,21 @@ def rl_rollout(model, data_path, physics_model_path, device, deterministic=False
             if log_prob is not None:
                 self.log_probs.append(log_prob)
             
-            # Store trajectory for REINFORCE (if enabled)
+            # Compute per-step cost (this is what we want to minimize)
+            step_cost = 0.0
+            lataccel_error = (target_lataccel - current_lataccel) ** 2
+            step_cost += lataccel_error * LAT_ACCEL_COST_MULTIPLIER * 100
+            
+            if self.prev_lataccel is not None:
+                jerk = ((current_lataccel - self.prev_lataccel) / DEL_T) ** 2
+                step_cost += jerk * 100
+            
+            self.prev_lataccel = current_lataccel
+            
+            # Store trajectory with per-step cost
             if collect_trajectory and hasattr(self.rl_ctrl, 'last_inputs') and self.rl_ctrl.last_inputs is not None:
                 past, cur, fut = self.rl_ctrl.last_inputs
-                self.trajectory.append((past, cur, fut, action))
+                self.trajectory.append((past, cur, fut, action, step_cost))
             
             return action
     
@@ -389,7 +403,7 @@ def rl_rollout(model, data_path, physics_model_path, device, deterministic=False
 
 
 def _rollout_worker(args):
-    """Worker function for parallel rollouts (evaluation only, no gradients)"""
+    """Worker function for parallel rollouts - collects trajectories with per-step costs"""
     data_path, physics_model_path, model_state_dict, hidden_dim = args
     
     from tinyphysics import TinyPhysicsModel, TinyPhysicsSimulator
@@ -401,18 +415,25 @@ def _rollout_worker(args):
     model.eval()
     
     try:
-        cost, _, pred_lat, target_lat = rl_rollout(
-            model, data_path, physics_model_path, device, deterministic=True
+        result = rl_rollout(
+            model, data_path, physics_model_path, device, 
+            deterministic=True, collect_trajectory=True
         )
-        return {'path': str(data_path), 'cost': cost, 'success': True}
+        cost, _, pred_lat, target_lat, trajectory = result
+        return {
+            'path': str(data_path), 
+            'cost': cost, 
+            'trajectory': trajectory,  # List of (past, cur, fut, action, step_cost)
+            'success': True
+        }
     except Exception as e:
-        return {'path': str(data_path), 'cost': None, 'success': False, 'error': str(e)}
+        return {'path': str(data_path), 'cost': None, 'trajectory': [], 'success': False, 'error': str(e)}
 
 
 def parallel_rollouts(model, data_files, physics_model_path, hidden_dim, n_workers=4):
     """
-    Run multiple rollouts in parallel for evaluation.
-    Returns list of costs.
+    Run multiple rollouts in parallel.
+    Returns list of (trajectory, cost) tuples for REINFORCE.
     """
     # Get model state dict (CPU)
     model_state = {k: v.cpu() for k, v in model.state_dict().items()}
@@ -429,8 +450,11 @@ def parallel_rollouts(model, data_files, physics_model_path, hidden_dim, n_worke
         
         for future in tqdm(as_completed(futures), total=len(futures), desc="Parallel rollouts"):
             result = future.result()
-            if result['success']:
-                results.append(result['cost'])
+            if result['success'] and len(result.get('trajectory', [])) > 0:
+                results.append({
+                    'trajectory': result['trajectory'],
+                    'cost': result['cost']['total_cost']
+                })
     
     return results
 
@@ -572,9 +596,9 @@ def curriculum_train(model, train_loader, val_loader, data_files, physics_model_
             epochs_in_phase2 = epoch - args.phase2_start_epoch
             rl_mix_ratio = min(0.7, 0.1 + epochs_in_phase2 * 0.1)  # 0.1 → 0.7
             phase_name = f"MIXED (RL={rl_mix_ratio:.0%})"
-        else:  # Phase 3 - "Pure RL" but keep 30% supervised to prevent forgetting
-            rl_mix_ratio = 0.7  # 70% RL, 30% supervised anchor
-            phase_name = "RL-FOCUSED (70% RL + 30% supervised)"
+        else:  # Phase 3 - Pure RL
+            rl_mix_ratio = 1.0  # 100% RL
+            phase_name = "PURE RL (100%)"
         
         print(f"\n{'='*60}")
         print(f"Epoch {epoch+1}/{total_epochs} | Phase {current_phase}: {phase_name}")
@@ -610,103 +634,124 @@ def curriculum_train(model, train_loader, val_loader, data_files, physics_model_
             
             train_loss /= max(n_supervised_batches, 1)
         
-        # === RL PORTION (Proper REINFORCE with trajectory collection) ===
+        # === RL PORTION (Batch collection + optimization) ===
         if rl_mix_ratio > 0 and data_files:
-            n_rl_episodes = max(4, int(8 * rl_mix_ratio))  # 4-8 episodes per epoch
+            n_rl_episodes = max(20, int(50 * rl_mix_ratio))  # 20-50 episodes per epoch
             episode_files = list(np.random.choice(data_files, size=min(n_rl_episodes, len(data_files)), replace=False))
             
-            # Collect trajectories from rollouts
+            # Collect trajectories from rollouts (parallel if n_workers > 1)
             all_trajectories = []  # List of (trajectory, cost)
             
             model.eval()  # No grad during rollout collection
-            for data_file in tqdm(episode_files, desc="RL Episodes"):
-                try:
-                    result = rl_rollout(
-                        model, data_file, physics_model_path, device, 
-                        deterministic=False, collect_trajectory=True
-                    )
-                    cost, log_probs, _, _, trajectory = result
-                except Exception as e:
-                    print(f"RL rollout failed: {e}")
-                    continue
-                
-                total_cost = cost['total_cost']
-                rl_costs.append(total_cost)
-                
-                if len(trajectory) > 0:
-                    all_trajectories.append((trajectory, total_cost))
-                
-                # Update baseline (exponential moving average)
-                if cost_baseline is None:
-                    cost_baseline = total_cost
-                else:
-                    cost_baseline = 0.95 * cost_baseline + 0.05 * total_cost
+            n_workers = min(args.n_workers, len(episode_files))
             
-            # === REINFORCE Policy Gradient Update ===
-            if all_trajectories and cost_baseline is not None:
+            if n_workers > 1:
+                # Parallel collection
+                results = parallel_rollouts(model, episode_files, physics_model_path, args.hidden, n_workers)
+                for r in results:
+                    total_cost = r['cost']['total_cost'] if isinstance(r['cost'], dict) else r['cost']
+                    rl_costs.append(total_cost)
+                    all_trajectories.append((r['trajectory'], total_cost))
+            else:
+                # Sequential collection
+                for data_file in tqdm(episode_files, desc="RL Episodes"):
+                    try:
+                        result = rl_rollout(
+                            model, data_file, physics_model_path, device, 
+                            deterministic=True, collect_trajectory=True
+                        )
+                        cost, log_probs, _, _, trajectory = result
+                    except Exception as e:
+                        print(f"RL rollout failed: {e}")
+                        continue
+                    
+                    total_cost = cost['total_cost']
+                    rl_costs.append(total_cost)
+                    
+                    if len(trajectory) > 0:
+                        all_trajectories.append((trajectory, total_cost))
+            
+            # Update baseline to mean of this batch
+            if rl_costs:
+                batch_mean = np.mean(rl_costs)
+                if cost_baseline is None:
+                    cost_baseline = batch_mean
+                else:
+                    cost_baseline = 0.8 * cost_baseline + 0.2 * batch_mean
+            
+            # === Reward-Weighted Regression (more stable than REINFORCE) ===
+            if all_trajectories and len(all_trajectories) >= 3:
                 model.train()
                 
-                # Compute advantages (lower cost = positive advantage = good)
-                advantages = []
-                for traj, cost in all_trajectories:
-                    # Normalize advantage
-                    adv = (cost_baseline - cost) / max(cost_baseline, 100.0)
-                    advantages.append(adv)
+                # Collect ALL per-step samples with costs
+                all_samples = []
                 
-                # Only update if we have both good and bad episodes (for variance reduction)
-                has_good = any(a > 0 for a in advantages)
-                has_bad = any(a < 0 for a in advantages)
+                for trajectory, episode_cost in all_trajectories:
+                    for step in trajectory:
+                        if len(step) == 5:
+                            all_samples.append(step)
                 
-                if has_good or has_bad:
-                    pg_loss = 0.0
-                    n_samples = 0
+                if len(all_samples) < 100:
+                    print(f"  [RL] Not enough samples: {len(all_samples)}")
+                else:
+                    step_costs = np.array([s[4] for s in all_samples])
+                    episode_costs = np.array([cost for _, cost in all_trajectories])
                     
-                    for (trajectory, cost), advantage in zip(all_trajectories, advantages):
-                        # Skip neutral episodes
-                        if abs(advantage) < 0.01:
-                            continue
-                        
-                        # Sample a subset of trajectory for efficiency
-                        max_steps = min(100, len(trajectory))
-                        step_indices = np.random.choice(len(trajectory), max_steps, replace=False) if len(trajectory) > max_steps else range(len(trajectory))
-                        
-                        for idx in step_indices:
-                            past_np, cur_np, fut_np, action_taken = trajectory[idx]
-                            
-                            # Convert to tensors with grad
-                            past = torch.tensor(past_np, dtype=torch.float32).unsqueeze(0).to(device)
-                            cur = torch.tensor(cur_np, dtype=torch.float32).unsqueeze(0).to(device)
-                            fut = torch.tensor(fut_np, dtype=torch.float32).unsqueeze(0).to(device)
-                            action = torch.tensor([[action_taken]], dtype=torch.float32).to(device)
-                            
-                            # Get log prob of the action that was taken
-                            mean, std, _ = model(past, cur, fut, deterministic=True)
-                            
-                            # Log prob of Gaussian: -0.5 * ((x-mu)/sigma)^2 - log(sigma) - 0.5*log(2*pi)
-                            log_std = torch.log(std + 1e-8)
-                            log_prob = -0.5 * ((action - mean) / (std + 1e-8)) ** 2 - log_std - 0.5 * np.log(2 * np.pi)
-                            
-                            # Policy gradient: maximize advantage * log_prob
-                            # So loss = -advantage * log_prob (we minimize loss)
-                            pg_loss += -advantage * log_prob.mean()
-                            n_samples += 1
+                    # Use FIXED baseline from first epoch (critical for stability!)
+                    if not hasattr(args, '_fixed_step_baseline'):
+                        args._fixed_step_baseline = np.percentile(step_costs, 50)  # Median of first epoch
+                        print(f"  [RL] Setting FIXED baseline: {args._fixed_step_baseline:.2f}")
                     
-                    if n_samples > 0:
-                        pg_loss = pg_loss / n_samples
+                    fixed_baseline = args._fixed_step_baseline
+                    
+                    # Find actions BETTER than fixed baseline (not current batch!)
+                    good_mask = step_costs < fixed_baseline
+                    n_good = good_mask.sum()
+                    
+                    print(f"  [RL] Episodes: cost_mean={episode_costs.mean():.1f}, cost_std={episode_costs.std():.1f}")
+                    print(f"  [RL] Steps: {len(all_samples)}, FIXED_baseline={fixed_baseline:.2f}, good={n_good}/{len(all_samples)} ({100*n_good/len(all_samples):.1f}%)")
+                    
+                    if n_good >= 50:
+                        # Collect only GOOD samples (beat the fixed baseline)
+                        good_samples = []
+                        for i, sample in enumerate(all_samples):
+                            if good_mask[i]:
+                                # Weight by improvement over baseline
+                                improvement = (fixed_baseline - step_costs[i]) / fixed_baseline
+                                weight = max(0.1, min(1.0, improvement * 2))
+                                good_samples.append((*sample[:4], weight))
                         
-                        # Scale down PG loss significantly - RL should make small adjustments
-                        pg_loss = pg_loss * 0.01
+                        np.random.shuffle(good_samples)
+                        batch = good_samples[:min(500, len(good_samples))]
                         
-                        # Skip update if loss is too extreme (something wrong)
-                        if abs(pg_loss.item()) > 1.0:
-                            print(f"  [RL] Skipping extreme PG loss: {pg_loss.item():.4f}")
-                        else:
-                            optimizer.zero_grad()
-                            pg_loss.backward()
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)  # Very conservative clipping
-                            optimizer.step()
-                            
-                            print(f"  [RL] PG update: loss={pg_loss.item():.6f}, samples={n_samples}")
+                        past_batch = torch.tensor(np.stack([s[0] for s in batch]), dtype=torch.float32).to(device)
+                        cur_batch = torch.tensor(np.stack([s[1] for s in batch]), dtype=torch.float32).to(device)
+                        fut_batch = torch.tensor(np.stack([s[2] for s in batch]), dtype=torch.float32).to(device)
+                        action_batch = torch.tensor([s[3] for s in batch], dtype=torch.float32).to(device)
+                        weight_batch = torch.tensor([s[4] for s in batch], dtype=torch.float32).to(device)
+                        
+                        # Forward pass
+                        mean, std, _ = model(past_batch, cur_batch, fut_batch, deterministic=True)
+                        
+                        # Weighted MSE - push mean toward good actions
+                        mse = (mean - action_batch) ** 2
+                        loss = (weight_batch * mse).mean()
+                        
+                        optimizer.zero_grad()
+                        loss.backward()
+                        
+                        total_grad_norm = 0
+                        for p in model.parameters():
+                            if p.grad is not None:
+                                total_grad_norm += p.grad.data.norm(2).item() ** 2
+                        total_grad_norm = total_grad_norm ** 0.5
+                        
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        optimizer.step()
+                        
+                        print(f"  [RL] MSE loss={loss.item():.6f}, grad_norm={total_grad_norm:.4f}, std_mean={std.mean().item():.4f}")
+                    else:
+                        print(f"  [RL] DEGRADED: Only {n_good} good actions - model worse than baseline!")
         
         # === VALIDATION ===
         model.eval()

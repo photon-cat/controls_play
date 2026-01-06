@@ -115,6 +115,10 @@ class TinyPhysicsSimulator:
     self.current_lataccel = self.current_lataccel_history[-1]
     seed = int(md5(self.data_path.encode()).hexdigest(), 16) % 10**4
     np.random.seed(seed)
+    
+    # Reset controller if it has a reset method
+    if hasattr(self.controller, 'reset'):
+      self.controller.reset()
 
   def get_data(self, data_path: str) -> pd.DataFrame:
     df = pd.read_csv(data_path)

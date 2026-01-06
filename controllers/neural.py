@@ -83,34 +83,60 @@ class SteerTransformer(nn.Module):
 
 
 class Controller(BaseController):
-    def __init__(self):
-        # Try models in order of preference
+    def __init__(self, model_path=None):
+        # Find model
         model_dir = Path(__file__).parent.parent / "models"
-        for name in ["steer_model_smooth_2.pt", "steer_model.pt", "steer_model_1.pt"]:
-            model_path = model_dir / name
-            if model_path.exists():
-                break
+        
+        if model_path:
+            model_path = Path(model_path)
+            if not model_path.exists():
+                model_path = model_dir / model_path
+        else:
+            # Try models in order of preference
+            for name in ["steer_model_smooth_2.pt", "steer_model.pt", "steer_model_1.pt"]:
+                model_path = model_dir / name
+                if model_path.exists():
+                    break
         
         if not model_path.exists():
             raise FileNotFoundError(
-                f"Neural model not found. "
+                f"Neural model not found at {model_path}. "
                 "Run: python train_steer_model.py --data_path data --epochs 20"
             )
         
         print(f"Loading neural model: {model_path.name}")
         
         # Load model
-        checkpoint = torch.load(model_path, map_location='cpu', weights_only=True)
+        checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
         model_type = checkpoint.get('model_type', 'transformer')
         hidden = checkpoint.get('hidden', 128)
         
+        # Get state dict - handle different checkpoint formats
+        if 'model_state' in checkpoint:
+            state_dict = checkpoint['model_state']
+        elif 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        else:
+            raise ValueError(f"Unknown checkpoint format, keys: {list(checkpoint.keys())}")
+        
+        # Auto-detect model type from state_dict keys
+        state_keys = set(state_dict.keys())
+        if 'past_proj.weight' in state_keys or 'future_proj.weight' in state_keys:
+            model_type = 'rl'  # SteerModelRL signature
+        
         if model_type == 'mlp':
             self.model = SteerMLP(hidden=hidden)
+        elif model_type == 'rl':
+            # RL model from train_steer_model_rl.py
+            from train_steer_model_rl import SteerModelRL
+            self.model = SteerModelRL(d_model=hidden)
+            self.is_rl_model = True
         else:
             self.model = SteerTransformer(d_model=hidden)
         
-        self.model.load_state_dict(checkpoint['model_state'])
+        self.model.load_state_dict(state_dict, strict=False)
         self.model.eval()
+        self.is_rl_model = model_type == 'rl'
         
         # Context buffer: (v_ego, a_ego, roll_lataccel, target_lataccel, steer_command, measured_lataccel)
         self.context = []
@@ -124,7 +150,8 @@ class Controller(BaseController):
         a_ego = state.a_ego
         
         # Add to context (using previous steer command and current measured lataccel)
-        obs = [v_ego, a_ego, roll_lataccel, target_lataccel, self.prev_steer, current_lataccel]
+        # For RL model: [v_ego, a_ego, roll, target, measured, steer]
+        obs = [v_ego, a_ego, roll_lataccel, target_lataccel, current_lataccel, self.prev_steer]
         self.context.append(obs)
         
         # Keep only last CONTEXT_LENGTH
@@ -137,15 +164,41 @@ class Controller(BaseController):
             self.prev_steer = np.clip(steer, -2, 2)
             return self.prev_steer
         
-        # Prepare inputs
-        ctx = torch.tensor(self.context, dtype=torch.float32).unsqueeze(0)  # (1, 10, 6)
-        cur = torch.tensor([v_ego, a_ego, roll_lataccel, target_lataccel, current_lataccel], 
-                          dtype=torch.float32).unsqueeze(0)  # (1, 5)
+        if self.is_rl_model:
+            # RL model with separate past/current/future
+            # past_ctx: (10, 6) - [vEgo, aEgo, roll, targetLat, measuredLat, steerCmd]
+            past_ctx = torch.tensor(self.context, dtype=torch.float32).unsqueeze(0)  # (1, 10, 6)
+            
+            # current: (4,) - [vEgo, aEgo, roll, measuredLat]
+            current = torch.tensor([v_ego, a_ego, roll_lataccel, current_lataccel], 
+                                  dtype=torch.float32).unsqueeze(0)  # (1, 4)
+            
+            # future_ctx: (10, 4) - [vEgo, aEgo, roll, targetLat]
+            if future_plan and hasattr(future_plan, 'lataccel') and len(future_plan.lataccel) >= CONTEXT_LENGTH:
+                future_ctx = torch.tensor(np.stack([
+                    np.array(future_plan.v_ego[:CONTEXT_LENGTH]),
+                    np.array(future_plan.a_ego[:CONTEXT_LENGTH]),
+                    np.array(future_plan.roll_lataccel[:CONTEXT_LENGTH]),
+                    np.array(future_plan.lataccel[:CONTEXT_LENGTH]),
+                ], axis=1), dtype=torch.float32).unsqueeze(0)  # (1, 10, 4)
+            else:
+                # No future plan, use zeros
+                future_ctx = torch.zeros(1, CONTEXT_LENGTH, 4)
+            
+            # Predict (deterministic for inference)
+            output = self.model(past_ctx, current, future_ctx, deterministic=True)
+            if isinstance(output, tuple):
+                steer = output[0].item()  # mean
+            else:
+                steer = output.item()
+        else:
+            # Original model interface
+            ctx = torch.tensor(self.context, dtype=torch.float32).unsqueeze(0)  # (1, 10, 6)
+            cur = torch.tensor([v_ego, a_ego, roll_lataccel, target_lataccel, current_lataccel], 
+                              dtype=torch.float32).unsqueeze(0)  # (1, 5)
+            steer = self.model(ctx, cur).item()
         
-        # Predict
-        steer = self.model(ctx, cur).item()
         steer = np.clip(steer, -2, 2)
-        
         self.prev_steer = steer
         return steer
 
