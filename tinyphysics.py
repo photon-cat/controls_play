@@ -42,6 +42,7 @@ FuturePlan = namedtuple('FuturePlan', ['lataccel', 'roll_lataccel', 'v_ego', 'a_
 
 DATASET_URL = "https://huggingface.co/datasets/commaai/commaSteeringControl/resolve/main/data/SYNTHETIC_V0.zip"
 DATASET_PATH = Path(__file__).resolve().parent / "data"
+DATASET_PATH_MINI = Path(__file__).resolve().parent / "data_mini"
 
 class LataccelTokenizer:
   def __init__(self):
@@ -286,10 +287,21 @@ if __name__ == "__main__":
   parser.add_argument("--log_path", type=str, default=None, help="Path to save simulation log CSV")
   args = parser.parse_args()
 
+  # Use data_mini as fallback if data doesn't exist
   if not DATASET_PATH.exists():
-    download_dataset()
+    if DATASET_PATH_MINI.exists():
+      print("Using data_mini (data folder not found)")
+      DATASET_PATH = DATASET_PATH_MINI
+    else:
+      download_dataset()
 
   data_path = Path(args.data_path)
+  # Also handle if user passes "data" but only data_mini exists
+  if not data_path.exists() and str(data_path).endswith('data'):
+    mini_path = Path(str(data_path) + '_mini')
+    if mini_path.exists():
+      print(f"Using {mini_path} (data folder not found)")
+      data_path = mini_path
   if data_path.is_file():
     cost, _, _ = run_rollout(data_path, args.controller, args.model_path, debug=args.debug, log_path=args.log_path)
     print(f"\nAverage lataccel_cost: {cost['lataccel_cost']:>6.4}, average jerk_cost: {cost['jerk_cost']:>6.4}, average total_cost: {cost['total_cost']:>6.4}")
