@@ -96,13 +96,12 @@ class TinyPhysicsModel:
 
 
 class TinyPhysicsSimulator:
-  def __init__(self, model: TinyPhysicsModel, data_path: str, controller: BaseController, debug: bool = False, log_path: str = None) -> None:
+  def __init__(self, model: TinyPhysicsModel, data_path: str, controller: BaseController, debug: bool = False) -> None:
     self.data_path = data_path
     self.sim_model = model
     self.data = self.get_data(data_path)
     self.controller = controller
     self.debug = debug
-    self.log_path = log_path
     self.reset()
 
   def reset(self) -> None:
@@ -116,8 +115,6 @@ class TinyPhysicsSimulator:
     self.current_lataccel = self.current_lataccel_history[-1]
     seed = int(md5(self.data_path.encode()).hexdigest(), 16) % 10**4
     np.random.seed(seed)
-    # Logging
-    self.sim_log = []
 
   def get_data(self, data_path: str) -> pd.DataFrame:
     df = pd.read_csv(data_path)
@@ -150,9 +147,6 @@ class TinyPhysicsSimulator:
       action = self.data['steer_command'].values[step_idx]
     action = np.clip(action, STEER_RANGE[0], STEER_RANGE[1])
     self.action_history.append(action)
-    # Notify controller of actual action used (for learning from labeled data)
-    if hasattr(self.controller, 'observe_action'):
-      self.controller.observe_action(action, step_idx)
 
   def get_state_target_futureplan(self, step_idx: int) -> Tuple[State, float, FuturePlan]:
     state = self.data.iloc[step_idx]
@@ -174,33 +168,7 @@ class TinyPhysicsSimulator:
     self.futureplan = futureplan
     self.control_step(self.step_idx)
     self.sim_step(self.step_idx)
-
-    # Log timestep data
-    log_entry = {
-      't': self.step_idx,
-      'vEgo': state.v_ego,
-      'aEgo': state.a_ego,
-      'roll': state.roll_lataccel / ACC_G,  # Convert back to roll angle
-      'targetLateralAcceleration': target,
-      'currentLateralAcceleration': self.current_lataccel,
-      'steerCommand': self.action_history[-1],
-    }
-    # Get controller log if available
-    if hasattr(self.controller, 'get_log'):
-      controller_log = self.controller.get_log()
-      if controller_log:
-        log_entry.update(controller_log)
-    self.sim_log.append(log_entry)
-
     self.step_idx += 1
-
-  def save_log(self, path: str = None) -> None:
-    """Save simulation log to CSV"""
-    save_path = path or self.log_path
-    if save_path and self.sim_log:
-      log_df = pd.DataFrame(self.sim_log)
-      log_df.to_csv(save_path, index=False)
-      print(f"Saved log to {save_path}")
 
   def plot_data(self, ax, lines, axis_labels, title) -> None:
     ax.clear()
@@ -239,11 +207,6 @@ class TinyPhysicsSimulator:
     if self.debug:
       plt.ioff()
       plt.show()
-
-    # Save log if path specified
-    if self.log_path:
-      self.save_log()
-
     return self.compute_cost()
 
 
@@ -251,16 +214,10 @@ def get_available_controllers():
   return [f.stem for f in Path('controllers').iterdir() if f.is_file() and f.suffix == '.py' and f.stem != '__init__']
 
 
-def run_rollout(data_path, controller_type, model_path, debug=False, log_path=None):
+def run_rollout(data_path, controller_type, model_path, debug=False):
   tinyphysicsmodel = TinyPhysicsModel(model_path, debug=debug)
   controller = importlib.import_module(f'controllers.{controller_type}').Controller()
-  # Inject physics model if controller supports it (for MPC)
-  if hasattr(controller, 'set_physics_model'):
-    controller.set_physics_model(tinyphysicsmodel)
-  # Inject data path if controller supports it (for learning)
-  if hasattr(controller, 'set_data_path'):
-    controller.set_data_path(str(data_path))
-  sim = TinyPhysicsSimulator(tinyphysicsmodel, str(data_path), controller=controller, debug=debug, log_path=log_path)
+  sim = TinyPhysicsSimulator(tinyphysicsmodel, str(data_path), controller=controller, debug=debug)
   return sim.rollout(), sim.target_lataccel_history, sim.current_lataccel_history
 
 
@@ -283,7 +240,6 @@ if __name__ == "__main__":
   parser.add_argument("--num_segs", type=int, default=100)
   parser.add_argument("--debug", action='store_true')
   parser.add_argument("--controller", default='pid', choices=available_controllers)
-  parser.add_argument("--log_path", type=str, default=None, help="Path to save simulation log CSV")
   args = parser.parse_args()
 
   if not DATASET_PATH.exists():
@@ -291,7 +247,7 @@ if __name__ == "__main__":
 
   data_path = Path(args.data_path)
   if data_path.is_file():
-    cost, _, _ = run_rollout(data_path, args.controller, args.model_path, debug=args.debug, log_path=args.log_path)
+    cost, _, _ = run_rollout(data_path, args.controller, args.model_path, debug=args.debug)
     print(f"\nAverage lataccel_cost: {cost['lataccel_cost']:>6.4}, average jerk_cost: {cost['jerk_cost']:>6.4}, average total_cost: {cost['total_cost']:>6.4}")
   elif data_path.is_dir():
     run_rollout_partial = partial(run_rollout, controller_type=args.controller, model_path=args.model_path, debug=False)
