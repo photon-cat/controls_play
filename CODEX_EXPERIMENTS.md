@@ -232,7 +232,7 @@ Create controllers/ensemble.py that runs multiple strategies and picks the best:
 2. Use weighted average: u = w1*u1 + w2*u2 + w3*u3 + w4*u4
 
 Search for optimal weights. Test on data_mini/00000.csv.
-Target: <85 cost.
+Target: <50 cost.
 ```
 
 **Deliverable:** Optimal weights and cost

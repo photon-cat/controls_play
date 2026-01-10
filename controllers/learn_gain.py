@@ -32,11 +32,12 @@ class Controller(BaseController):
         self.min_gain = 0.4
         self.max_gain = 4.0
 
-        self.base_lr = 0.02
-        self.command_rate_scale = 0.8
+        self.base_lr = 0.03
+        self.command_rate_scale = 0.7
         self.turning_threshold = 0.05
+        self.min_command = 0.1
 
-        self.ff_weight = 0.4
+        self.ff_weight = 0.5
 
         self.kp = 0.195
         self.ki = 0.10
@@ -47,6 +48,8 @@ class Controller(BaseController):
         self.prev_u_cmd = 0.0
         self.prev_u_rate = 0.0
         self.step_count = 0
+
+        self.cmd_history = []
 
         self._log = {}
 
@@ -88,13 +91,26 @@ class Controller(BaseController):
         self.prev_error = error
 
         u_pid = (self.kp * error + self.ki * self.error_integral + self.kd * error_diff)
+        u_pid = u_pid / max(self.gain, 1e-3)
         u_cmd = np.clip(u_pid + (self.ff_weight * u_ff), -2.0, 2.0)
 
+        self.cmd_history.append(u_cmd)
+        if len(self.cmd_history) > 50:
+            self.cmd_history.pop(0)
+
         turning_now = target_lataccel - roll_lataccel
-        if self.step_count >= CONTROL_START_IDX and abs(turning_now) > self.turning_threshold:
-            lr = self.base_lr / (1.0 + abs(self.prev_u_rate))
-            grad = error * turning_now / max(self.gain, 1e-3)
-            self.gain -= lr * grad
+        turning_actual = current_lataccel - roll_lataccel
+        if (
+            self.step_count >= CONTROL_START_IDX
+            and abs(turning_now) > self.turning_threshold
+            and abs(u_cmd) > self.min_command
+        ):
+            update_weight = abs(u_ff) / (abs(u_ff) + abs(u_pid) + 1e-3)
+            lr = self.base_lr * update_weight / (1.0 + abs(self.prev_u_rate))
+            lag_index = min(lag_steps, len(self.cmd_history) - 1)
+            u_update = self.cmd_history[-1 - lag_index]
+            gain_error = turning_actual - (self.gain * u_update)
+            self.gain += lr * gain_error * u_update
             self.gain = float(np.clip(self.gain, self.min_gain, self.max_gain))
 
         self.prev_u_rate = u_cmd - self.prev_u_cmd
