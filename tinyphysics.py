@@ -181,7 +181,8 @@ class TinyPhysicsSimulator:
       't': self.step_idx,
       'vEgo': state.v_ego,
       'aEgo': state.a_ego,
-      'roll': state.roll_lataccel / ACC_G,  # Convert back to roll angle
+      'roll': np.arcsin(state.roll_lataccel / ACC_G),  # Convert back to roll angle (radians)
+      'rollLateralAcceleration': state.roll_lataccel,
       'targetLateralAcceleration': target,
       'currentLateralAcceleration': self.current_lataccel,
       'steerCommand': self.action_history[-1],
@@ -252,6 +253,12 @@ def get_available_controllers():
   return [f.stem for f in Path('controllers').iterdir() if f.is_file() and f.suffix == '.py' and f.stem != '__init__']
 
 
+def run_rollout_with_log_folder(data_path, controller_type, model_path, log_folder=None):
+  """Wrapper for multiprocessing that generates log_path from log_folder."""
+  log_path = str(Path(log_folder) / f"{Path(data_path).stem}.csv") if log_folder else None
+  return run_rollout(data_path, controller_type, model_path, debug=False, log_path=log_path)
+
+
 def run_rollout(data_path, controller_type, model_path, debug=False, log_path=None):
   tinyphysicsmodel = TinyPhysicsModel(model_path, debug=debug)
   controller = importlib.import_module(f'controllers.{controller_type}').Controller()
@@ -276,15 +283,42 @@ def download_dataset():
             dest.write(src.read())
 
 
+def get_unique_log_path(log_dir: Path, segment_name: str, controller: str) -> Path:
+  """Get unique log file path, incrementing suffix if file exists."""
+  base_path = log_dir / f"{segment_name}_{controller}.csv"
+  if not base_path.exists():
+    return base_path
+  n = 2
+  while True:
+    path = log_dir / f"{segment_name}_{controller}_{n}.csv"
+    if not path.exists():
+      return path
+    n += 1
+
+
+def get_unique_log_folder(log_dir: Path, controller: str) -> Path:
+  """Get unique log folder for multi-segment runs."""
+  base_path = log_dir / controller
+  if not base_path.exists():
+    return base_path
+  n = 2
+  while True:
+    path = log_dir / f"{controller}_{n}"
+    if not path.exists():
+      return path
+    n += 1
+
+
 if __name__ == "__main__":
   available_controllers = get_available_controllers()
   parser = argparse.ArgumentParser()
   parser.add_argument("--model_path", type=str, required=True)
   parser.add_argument("--data_path", type=str, required=True)
   parser.add_argument("--num_segs", type=int, default=100)
+  parser.add_argument("--num_segs_rand", type=int, default=None, help="Sample N random segments instead of first N")
   parser.add_argument("--debug", action='store_true')
   parser.add_argument("--controller", default='pid', choices=available_controllers)
-  parser.add_argument("--log_path", type=str, default=None, help="Path to save simulation log CSV")
+  parser.add_argument("--log_path", type=str, default=None, help="Folder to save simulation logs")
   args = parser.parse_args()
 
   # Use data_mini as fallback if data doesn't exist
@@ -303,11 +337,31 @@ if __name__ == "__main__":
       print(f"Using {mini_path} (data folder not found)")
       data_path = mini_path
   if data_path.is_file():
-    cost, _, _ = run_rollout(data_path, args.controller, args.model_path, debug=args.debug, log_path=args.log_path)
+    log_file = None
+    if args.log_path:
+      log_dir = Path(args.log_path)
+      log_dir.mkdir(parents=True, exist_ok=True)
+      segment_name = data_path.stem
+      log_file = str(get_unique_log_path(log_dir, segment_name, args.controller))
+    cost, _, _ = run_rollout(data_path, args.controller, args.model_path, debug=args.debug, log_path=log_file)
     print(f"\nAverage lataccel_cost: {cost['lataccel_cost']:>6.4}, average jerk_cost: {cost['jerk_cost']:>6.4}, average total_cost: {cost['total_cost']:>6.4}")
   elif data_path.is_dir():
-    run_rollout_partial = partial(run_rollout, controller_type=args.controller, model_path=args.model_path, debug=False)
-    files = sorted(data_path.iterdir())[:args.num_segs]
+    import random
+    all_files = sorted(data_path.iterdir())
+    if args.num_segs_rand is not None:
+      files = random.sample(all_files, min(args.num_segs_rand, len(all_files)))
+    else:
+      files = all_files[:args.num_segs]
+
+    log_folder = None
+    if args.log_path:
+      log_dir = Path(args.log_path)
+      log_dir.mkdir(parents=True, exist_ok=True)
+      log_folder = get_unique_log_folder(log_dir, args.controller)
+      log_folder.mkdir(parents=True, exist_ok=True)
+      print(f"Saving logs to {log_folder}")
+
+    run_rollout_partial = partial(run_rollout_with_log_folder, controller_type=args.controller, model_path=args.model_path, log_folder=str(log_folder) if log_folder else None)
     results = process_map(run_rollout_partial, files, max_workers=16, chunksize=10)
     costs = [result[0] for result in results]
     costs_df = pd.DataFrame(costs)

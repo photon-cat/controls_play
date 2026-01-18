@@ -69,3 +69,6 @@ python eval.py --model_path ./models/tinyphysics.onnx --data_path ./data --num_s
 
 Like this sort of stuff? You might want to work at comma!
 [comma.ai/jobs](https://comma.ai/jobs)
+
+
+:  132.3
